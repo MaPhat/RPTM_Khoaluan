@@ -6,16 +6,20 @@ import torch
 from utils.evaluation import evaluate, evaluate_vid
 from utils.reranking import re_ranking
 from utils.avgmeter import AverageMeter
+from tqdm import tqdm
+from utils.graph_reranking import *
 
 
-def do_test(model, queryloader, galleryloader, batch_size, use_gpu, dataset, ranks=[1, 5, 10]):
+def do_test(model, queryloader, galleryloader, batch_size, use_gpu, dataset, ranks=[1, 5, 10], reranking=False, graph_reranking=False, learn_based=False, gcn_model=None):
     batch_time = AverageMeter()
 
     model.eval()
+    if gcn_model is not None:
+        gcn_model.eval()
 
     with torch.no_grad():
         qf, q_pids, q_camids = [], [], []
-        for batch_idx, (imgs, pids, camids, _) in enumerate(queryloader):
+        for batch_idx, (imgs, pids, camids, _) in enumerate(tqdm(queryloader)):
             if use_gpu:
                 imgs = imgs.cuda()
 
@@ -34,7 +38,7 @@ def do_test(model, queryloader, galleryloader, batch_size, use_gpu, dataset, ran
         print('Extracted features for query set, obtained {}-by-{} matrix'.format(qf.size(0), qf.size(1)))
 
         gf, g_pids, g_camids = [], [], []
-        for batch_idx, (imgs, pids, camids, _) in enumerate(galleryloader):
+        for batch_idx, (imgs, pids, camids, _) in enumerate(tqdm(galleryloader)):
             if use_gpu:
                 imgs = imgs.cuda()
 
@@ -54,36 +58,69 @@ def do_test(model, queryloader, galleryloader, batch_size, use_gpu, dataset, ran
 
     print('=> BatchTime(s)/BatchSize(img): {:.3f}/{}'.format(batch_time.avg, batch_size))
 
-    m, n = qf.size(0), gf.size(0)
-    distmat = torch.pow(qf, 2).sum(dim=1, keepdim=True).expand(m, n) + \
-              torch.pow(gf, 2).sum(dim=1, keepdim=True).expand(n, m).t()
-    distmat.addmm_(1, -2, qf, gf.t())
-    distmat = distmat.numpy()
-
-    print('Computing CMC and mAP')
-    if dataset == 'vehicleid':
-        cmc, mAP = evaluate_vid(distmat, q_pids, g_pids, q_camids, g_camids, 50)
+    if reranking:
+        print("Start Original Re-ranking \n")
+        distmat = re_ranking(qf, gf, k1=80, k2=15, lambda_value=0.2)
+        print('Computing CMC and mAP')
+        if dataset == 'vehicleid':
+            cmc, mAP = evaluate_vid(distmat, q_pids, g_pids, q_camids, g_camids, 50)
+        else:
+            cmc, mAP = evaluate(distmat, q_pids, g_pids, q_camids, g_camids, 50)
+        print('Re-Ranked Results--')
+        print('mAP: {:.1%}'.format(mAP))
+        print('CMC curve')
+        for r in ranks:
+            print('Rank-{:<3}: {:.1%}'.format(r, cmc[r - 1]))
+        print('------------------')
+    elif graph_reranking:
+        if learn_based and gcn_model is not None:
+            print("Start GCN Model for Graph Re-ranking \n")
+            distmat = graph_reranking_func(qf, gf, q_camids, g_camids, gcn_model=gcn_model)
+            print('Computing CMC and mAP')
+            if dataset == 'vehicleid':
+                cmc, mAP = evaluate_vid(distmat, q_pids, g_pids, q_camids, g_camids, 50)
+            else:
+                cmc, mAP = evaluate(distmat, q_pids, g_pids, q_camids, g_camids, 50)
+            print('GCN Model for Graph Re-ranked Results--')
+            print('mAP: {:.1%}'.format(mAP))
+            print('CMC curve')
+            for r in ranks:
+                print('Rank-{:<3}: {:.1%}'.format(r, cmc[r - 1]))
+            print('------------------')
+        else:
+            print("Start Graph Re-Ranking \n")
+            distmat = graph_reranking_func(qf, gf, q_camids, g_camids)
+            print('Computing CMC and mAP')
+            if dataset == 'vehicleid':
+                cmc, mAP = evaluate_vid(distmat, q_pids, g_pids, q_camids, g_camids, 50)
+            else:
+                cmc, mAP = evaluate(distmat, q_pids, g_pids, q_camids, g_camids, 50)
+            print('Graph Re-ranked Results--')
+            print('mAP: {:.1%}'.format(mAP))
+            print('CMC curve')
+            for r in ranks:
+                print('Rank-{:<3}: {:.1%}'.format(r, cmc[r - 1]))
+            print('------------------')
     else:
-        cmc, mAP = evaluate(distmat, q_pids, g_pids, q_camids, g_camids, 50)
+        print("No Re-ranking \n")
+        m, n = qf.size(0), gf.size(0)
+        distmat = torch.pow(qf, 2).sum(dim=1, keepdim=True).expand(m, n) + \
+                torch.pow(gf, 2).sum(dim=1, keepdim=True).expand(n, m).t()
+        distmat.addmm_(qf, gf.t(), beta=1, alpha=-2)
+        distmat = distmat.numpy()
 
-    print('Results ----------')
-    print('mAP: {:.1%}'.format(mAP))
-    print('CMC curve')
-    for r in ranks:
-        print('Rank-{:<3}: {:.1%}'.format(r, cmc[r - 1]))
-    print('------------------')
+        print('Computing CMC and mAP')
+        if dataset == 'vehicleid':
+            cmc, mAP = evaluate_vid(distmat, q_pids, g_pids, q_camids, g_camids, 50)
+        else:
+            cmc, mAP = evaluate(distmat, q_pids, g_pids, q_camids, g_camids, 50)
 
-    distmat_re = re_ranking(qf, gf, k1=80, k2=15, lambda_value=0.2)
-    print('Computing CMC and mAP')
-    if dataset == 'vehicleid':
-        cmc_re, mAP_re = evaluate_vid(distmat_re, q_pids, g_pids, q_camids, g_camids, 50)
-    else:
-        cmc_re, mAP_re = evaluate(distmat_re, q_pids, g_pids, q_camids, g_camids, 50)
-    print('Re-Ranked Results--')
-    print('mAP: {:.1%}'.format(mAP_re))
-    print('CMC curve')
-    for r in ranks:
-        print('Rank-{:<3}: {:.1%}'.format(r, cmc_re[r - 1]))
-    print('------------------')
+        print('No Re-ranked Results ----------')
+        print('mAP: {:.1%}'.format(mAP))
+        print('CMC curve')
+        for r in ranks:
+            print('Rank-{:<3}: {:.1%}'.format(r, cmc[r - 1]))
+        print('------------------')
 
-    return cmc[0], distmat, cmc_re[0], distmat_re
+
+    return cmc[0], distmat

@@ -35,30 +35,30 @@ class VehicleID(BaseImageDataset):
     """
     dataset_dir = 'vehicleid'
 
-    def __init__(self, root='datasets', verbose=True, test_size=2400, **kwargs):
+    def __init__(self, root='datasets', verbose=True, test_size=800, **kwargs):
         super(VehicleID, self).__init__(root)
         self.dataset_dir = osp.join(self.root, self.dataset_dir)
         self.img_dir = osp.join(self.dataset_dir, 'image')
-        self.train_dir = osp.join(self.dataset_dir, 'image_train')
+        self.train_dir = osp.join(self.dataset_dir, 'image')
         self.split_dir = osp.join(self.dataset_dir, 'train_test_split')
         self.train_list = osp.join(self.split_dir, 'train_list.txt')
         self.test_size = test_size
 
         if self.test_size == 800:
-            self.gallery_dir = osp.join(self.dataset_dir, 'image_gallery_800')
+            self.gallery_dir = osp.join(self.dataset_dir, 'image')
             self.test_list = osp.join(self.split_dir, 'test_list_800.txt')
         elif self.test_size == 1600:
-            self.gallery_dir = osp.join(self.dataset_dir, 'image_gallery_1600')
+            self.gallery_dir = osp.join(self.dataset_dir, 'image')
             self.test_list = osp.join(self.split_dir, 'test_list_1600.txt')
         elif self.test_size == 2400:
-            self.gallery_dir = osp.join(self.dataset_dir, 'image_gallery_2400')
+            self.gallery_dir = osp.join(self.dataset_dir, 'image')
             self.test_list = osp.join(self.split_dir, 'test_list_2400.txt')
 
         print(self.gallery_dir)
 
         self.check_before_run()
 
-        train = self.process_dir(self.train_dir, relabel=True)
+        train = self.process_dir(self.train_list, relabel=True)
         query, gallery = self.process_split(relabel=True)
 
         self.train = train
@@ -103,25 +103,29 @@ class VehicleID(BaseImageDataset):
             output.append((img_path, pid, camid))
         return output
 
-    def process_dir(self, dir_path, relabel=False):
-        img_paths = sorted(glob.glob(osp.join(dir_path, '*.jpg')))
-        #pattern = re.compile(r'([-\d]+)_c([-\d]+)')
+    def process_dir(self, list_file, relabel=False):
+        with open(list_file, 'r') as f:
+            lines = f.readlines()
 
         pid_container = set()
-        for img_path in img_paths:
-            pid = int(re.search(r'([-\d]+)', img_path).group())
+        for line in lines:
+            imgid, pid = line.strip().split()
+            pid = int(pid)
             if pid == -1:
-                continue  # junk images are just ignored
+                continue
             pid_container.add(pid)
         pid2label = {pid: label for label, pid in enumerate(pid_container)}
 
         dataset = []
-        for img_path in img_paths:
-            pid = int(re.search(r'([-\d]+)', img_path).group())
+        for line in lines:
+            imgid, pid = line.strip().split()
+            pid = int(pid)
             if pid == -1:
-                continue  # junk images are just ignored
-            assert 0 <= pid <= 131640  # pid == 0 means background
-            pid = pid2label[pid]
+                continue
+            if relabel:
+                pid = pid2label[pid]
+            img_name = str(imgid).zfill(7) + '.jpg'
+            img_path = osp.join(self.dataset_dir, 'image', img_name)
             camid = 1
             dataset.append((img_path, pid, camid))
 

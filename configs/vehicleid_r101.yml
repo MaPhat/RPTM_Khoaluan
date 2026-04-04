@@ -19,9 +19,9 @@ INPUT:
 DATASET:
   SOURCE_NAME: ['vehicleid']
   TARGET_NAME: ['vehicleid']
-  ROOT_DIR: './data/'
-  TRAIN_DIR: './data/vehicleid/image_train/'
-  SPLIT_DIR: './data/vehicleid/train_split/'
+  ROOT_DIR: '/workspace/data/'
+  TRAIN_DIR: '/workspace/data/vehicleid/image/'
+  SPLIT_DIR: '/workspace/data/vehicleid/train_split/'
 
 DATALOADER:
   SAMPLER: 'RandomSampler'
@@ -30,7 +30,7 @@ DATALOADER:
 
 SOLVER:
   OPTIMIZER_NAME: 'sgd'
-  MAX_EPOCHS: 40
+  MAX_EPOCHS: 30
   BASE_LR: 0.005
   LR_SCHEDULER: 'multi-step'
   STEPSIZE: [10, 20, 30]
@@ -43,10 +43,10 @@ SOLVER:
   WARMUP_EPOCHS: 10
   WARMUP_METHOD: 'linear'
   LARGE_FC_LR: False
-  TRAIN_BATCH_SIZE: 20
+  TRAIN_BATCH_SIZE: 90
   USE_AMP: False
-  CHECKPOINT_PERIOD: 10
-  LOG_PERIOD: 50
+  CHECKPOINT_PERIOD: 1
+  LOG_PERIOD: 1
   EVAL_PERIOD: 1
 
 LOSS:
@@ -59,15 +59,17 @@ TEST:
   WEIGHT: ''
   TEST_BATCH_SIZE: 100
   TEST_SIZE: 800
-  RE_RANKING: True
+  RE_RANKING: False
+  GRAPH_RE_RANKING: False
+  LEARN_BASED: False
   VIS_RANK: True
   NECK_FEAT: 'after'
   FEAT_NORM: 'yes'
 
 MISC:
-  SAVE_DIR: './logs/vehicleid/'
-  GMS_PATH: './gms/vehicleid/'
-  INDEX_PATH: './pkl/vehicleid/index.pkl'
+  SAVE_DIR: '/workspace/RPTM_reid/logs/vehicleid/'
+  GMS_PATH: '/workspace/gms/vehicleid/'
+  INDEX_PATH: '/workspace/gms/vehicleid/index_vp_vehicleid.pkl'
   USE_GPU: True
   PRINT_FREQ: 100
   FP16: True

@@ -19,12 +19,13 @@ def data_loader(cfg, dataset_kwargs, transform_kwargs):
         path = img_path.split('/', 4)[-1]
         if cfg.DATASET.SOURCE_NAME[0] == 'veri':
             folder = path.split('_', 1)[0][1:]
+        elif cfg.DATASET.SOURCE_NAME[0] == 'vehicleid':
+            folder = os.path.basename(img_path)   # e.g. '0187182.jpg'
         else:
             folder = path.split('_', 1)[0]
         pid += num_train_pids
         camid += num_train_cams
         train.append((path, folder, pid, camid))
-
     num_train_pids += dataset.num_train_pids
     class_names = num_train_pids
     num_train_cams += dataset.num_train_cams
@@ -35,6 +36,8 @@ def data_loader(cfg, dataset_kwargs, transform_kwargs):
         path = img_path.split('/', 4)[-1]
         if cfg.DATASET.SOURCE_NAME[0] == 'veri':
             folder = path.split('_', 1)[0][1:]
+        elif cfg.DATASET.SOURCE_NAME[0] == 'vehicleid':
+            folder = os.path.basename(img_path)   # e.g. '0187182.jpg'
         else:
             folder = path.split('_', 1)[0]
         pidx[folder] = pid
@@ -44,13 +47,15 @@ def data_loader(cfg, dataset_kwargs, transform_kwargs):
     entries = sorted(os.listdir(cfg.MISC.GMS_PATH))
     # print(entries)
     for name in entries:
+        if not name.endswith('.pkl') or name.startswith('index_'):
+            continue
         f = open((cfg.MISC.GMS_PATH + name), 'rb')
         if name == 'featureMatrix.pkl':
             s = name[0:13]
         else:
-            s = name[0:3]
+            s = name.split('.')[0]  # e.g. '10106' from '10106.pkl'
         gms[s] = pickle.load(f)
-        f.close
+        f.close()
 
     transform_t = train_transforms(**transform_kwargs)
     if cfg.DATASET.SOURCE_NAME[0] == 'veri':

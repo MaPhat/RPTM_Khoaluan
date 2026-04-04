@@ -1,0 +1,30 @@
+# Logs
+*.logs
+/logs/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Virtual environments
+venv/
+.env/
+env/
+
+# Model checkpoints & weights
+*.pth
+*.pth.tar
+*.ckpt
+
+# Pickle files
+*.pkl
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db

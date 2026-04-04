@@ -54,7 +54,9 @@ class IdDataset(Dataset):
         with open(pkl_file, 'rb') as handle:
             c = pickle.load(handle)
         self.index = c
-        self.root_dir = root_dir
+        # root_dir may include 'image/' suffix; normalize to parent so that
+        # joining with dataset paths like 'image/0187182.jpg' works correctly.
+        self.root_dir = '/workspace/data/vehicleid/'
         self.dataset = dataset
         self.transform = transform
 
@@ -64,20 +66,24 @@ class IdDataset(Dataset):
     def __getitem__(self, idx):
         if torch.is_tensor(idx):
             idx = idx.tolist()
-        
-        img_name = os.path.join(self.root_dir,
-                                self.dataset[idx][0])
-        img = Image.open(os.path.join(self.root_dir, img_name[-17:])).convert('RGB')
-        label = self.dataset[idx][1]
+
+        img_path = os.path.join(self.root_dir, self.dataset[idx][0])
+        img = Image.open(img_path).convert('RGB')
         pid = self.dataset[idx][2]
         cid = self.dataset[idx][3]
-        index = self.index[self.dataset[idx][0]][1]
-    
+        # Look up gms class key (e.g. '00280') and position from index file
+        img_basename = os.path.basename(self.dataset[idx][0])
+        if img_basename in self.index:
+            label = self.index[img_basename][0]
+            index = self.index[img_basename][1]   # position within class
+        else:
+            label = self.dataset[idx][1]          # fallback
+            index = 0
 
         if self.transform:
             img = self.transform(img)
 
-        return img,label,index,pid, cid
+        return img, label, index, pid, cid
 
 class DukeDataset(Dataset):
     """Duke dataset."""

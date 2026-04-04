@@ -19,11 +19,13 @@ from utils.torchtools import accuracy, save_checkpoint
 from utils.functions import search, strint
 from utils.avgmeter import AverageMeter
 from utils.visualtools import visualize_ranked_results
-
+from utils.graph_reranking import *
+from tqdm import tqdm
 
 def do_train(cfg, trainloader, train_dict, data_tfr, testloader_dict, dm,
-             model, optimizer, scheduler, criterion_htri,criterion_xent):
+             model, optimizer, scheduler, criterion_htri,criterion_xent, gcn_model=None):
     ranklogger = RankLogger(cfg.DATASET.SOURCE_NAME, cfg.DATASET.TARGET_NAME)
+    use_gpu = cfg.MISC.USE_GPU
     gms = train_dict['gms']
     pidx = train_dict['pidx']
     folders = []
@@ -32,19 +34,24 @@ def do_train(cfg, trainloader, train_dict, data_tfr, testloader_dict, dm,
     # data_index = search_index(gms, cfg.DATASET.SPLIT_DIR, folders)
     data_index = search(cfg.DATASET.SPLIT_DIR)
 
+    best_rank1 = 0.0
+    best_epoch = 0
+    patience_counter = 0
+
     for epoch in range(cfg.SOLVER.MAX_EPOCHS):
         losses = AverageMeter()
         xent_losses = AverageMeter()
         htri_losses = AverageMeter()
         accs = AverageMeter()
         batch_time = AverageMeter()
-
+        if gcn_model is not None:
+            gcn_model.train()
         model.train()
         for p in model.parameters():
             p.requires_grad = True  # open all layers
 
         end = time.time()
-        for batch_idx, (img, label, index, pid, _) in enumerate(trainloader):
+        for batch_idx, (img, label, index, pid, cid) in enumerate(tqdm(trainloader)):
 
             trainX, trainY = torch.zeros((cfg.SOLVER.TRAIN_BATCH_SIZE * 3, 3, cfg.INPUT.HEIGHT, cfg.INPUT.WIDTH), dtype=torch.float32), torch.zeros(
                 (cfg.SOLVER.TRAIN_BATCH_SIZE * 3), dtype=torch.int64)
@@ -68,17 +75,16 @@ def do_train(cfg, trainloader, train_dict, data_tfr, testloader_dict, dm,
                 else:
                     threshold = np.arange(np.amax(gms[labelx][indexx]) // 2) #defaults to mean
 
-                minpos = np.argmin(ma.masked_where(a == threshold, a))
+                minpos = np.argmin(ma.masked_where(np.isin(a, threshold), a))
                 pos_dic = data_tfr[data_index[cidx][1] + minpos]
                 # print(pos_dic[1])
-                neg_label = int(labelx)
+                # Pick a random negative label from the available gms keys, different from current
+                gms_keys = list(gms.keys())
                 while True:
-                    neg_label = random.choice(range(1, 770))
-                    if neg_label is not int(labelx) and os.path.isdir(
-                            os.path.join(cfg.DATASET.SPLIT_DIR, strint(neg_label, 'veri'))) is True:
+                    negative_label = random.choice(gms_keys)
+                    if negative_label != labelx:
                         break
-                negative_label = strint(neg_label, 'veri')
-                neg_cid = pidx[negative_label]
+                neg_cid = pidx.get(negative_label, random.choice(list(pidx.values())))
                 neg_index = random.choice(range(0, len(gms[negative_label])))
 
                 neg_dic = data_tfr[data_index[neg_cid][1] + neg_index]
@@ -92,11 +98,34 @@ def do_train(cfg, trainloader, train_dict, data_tfr, testloader_dict, dm,
             trainX = trainX.cuda()
             trainY = trainY.cuda()
             outputs, features = model(trainX)
-            xent_loss = criterion_xent(outputs[0:cfg.SOLVER.TRAIN_BATCH_SIZE], trainY[0:cfg.SOLVER.TRAIN_BATCH_SIZE])
-            htri_loss = criterion_htri(features, trainY)
 
-            
-            loss = cfg.LOSS.LAMBDA_HTRI * htri_loss + cfg.LOSS.LAMBDA_XENT * xent_loss
+            if gcn_model is not None:
+                B = cfg.SOLVER.TRAIN_BATCH_SIZE
+                
+                # Build graphs and refine ALL features (anchor, positive, negative)
+                cam = cid  # use real camera IDs, not image indices
+                # Replicate cam for positive and negative samples
+                cam_all = torch.cat([cam, cam, cam], dim=0)
+                
+                A_g, A_c = build_graphs_for_batch(features, cam_all)
+                A_g_norm = normalize_adj(A_g)
+                if A_c.sum() == 0 or torch.isnan(A_c).any():
+                    A_c_norm = torch.zeros_like(A_c)
+                else:
+                    A_c_norm = normalize_adj(A_c)
+                refined_global = gcn_model(features, A_g_norm, A_c_norm)
+
+                gcn_recon_loss = torch.nn.functional.mse_loss(refined_global, features.detach())
+
+                xent_loss = criterion_xent(outputs[0:cfg.SOLVER.TRAIN_BATCH_SIZE], trainY[0:cfg.SOLVER.TRAIN_BATCH_SIZE])
+                htri_loss = criterion_htri(refined_global, trainY)
+
+                gcn_weight = 0.05
+                loss = cfg.LOSS.LAMBDA_HTRI * htri_loss + cfg.LOSS.LAMBDA_XENT * xent_loss + gcn_weight * gcn_recon_loss if gcn_model is not None else cfg.LOSS.LAMBDA_HTRI * htri_loss + cfg.LOSS.LAMBDA_XENT * xent_loss
+            else:
+                xent_loss = criterion_xent(outputs[0:cfg.SOLVER.TRAIN_BATCH_SIZE], trainY[0:cfg.SOLVER.TRAIN_BATCH_SIZE])
+                htri_loss = criterion_htri(features, trainY) 
+                loss = cfg.LOSS.LAMBDA_HTRI * htri_loss + cfg.LOSS.LAMBDA_XENT * xent_loss
 
             if cfg.SOLVER.USE_AMP:
                 with amp.scale_loss(loss, optimizer) as scaled_loss:
@@ -137,14 +166,50 @@ def do_train(cfg, trainloader, train_dict, data_tfr, testloader_dict, dm,
             print('Evaluating {} ...'.format(name))
             queryloader = testloader_dict[name]['query']
             galleryloader = testloader_dict[name]['gallery']
-            rank1, distmat, rank2, distmat_re = do_test(model, queryloader, galleryloader, cfg.TEST.TEST_BATCH_SIZE, cfg.MISC.USE_GPU, cfg.DATASET.TARGET_NAME[0])
-            
+
+            if gcn_model is not None:
+                rank1, distmat = do_test(model=model, queryloader=queryloader, galleryloader=galleryloader, batch_size=cfg.TEST.TEST_BATCH_SIZE, use_gpu=use_gpu, dataset=cfg.DATASET.TARGET_NAME[0], reranking=cfg.TEST.RE_RANKING, graph_reranking=cfg.TEST.GRAPH_RE_RANKING, learn_based=cfg.TEST.LEARN_BASED, gcn_model=gcn_model)
+            else:
+                rank1, distmat = do_test(model=model, queryloader=queryloader, galleryloader=galleryloader, batch_size=cfg.TEST.TEST_BATCH_SIZE, use_gpu=use_gpu, dataset=cfg.DATASET.TARGET_NAME[0], reranking=cfg.TEST.RE_RANKING, graph_reranking=cfg.TEST.GRAPH_RE_RANKING)
+
             ranklogger.write(name, epoch + 1, rank1)
-            ranklogger.write(name, epoch + 1, rank2)
+            # ranklogger.write(name, epoch + 1, rank2)
+            
+            if cfg.SOLVER.EARLY_STOPPING:
+                if rank1 > best_rank1 + cfg.SOLVER.MIN_DELTA:
+                    best_rank1 = rank1
+                    best_epoch = epoch + 1
+                    patience_counter = 0
+                    print(f'[Early Stopping] New best Rank-1: {best_rank1:.2%} at epoch {best_epoch}')
+                    # Save best model
+                    save_checkpoint({
+                        'state_dict': model.state_dict(),
+                        'rank1': rank1,
+                        'epoch': epoch + 1,
+                        'arch': cfg.MODEL.ARCH,
+                        'optimizer': optimizer.state_dict(),
+                    }, cfg.MISC.SAVE_DIR, 'best_model')
+                    
+                    if gcn_model is not None:
+                        gcn_best_path = osp.join(cfg.MISC.SAVE_DIR, 'gcn_best_model.pth')
+                        torch.save({
+                            'state_dict': gcn_model.state_dict(),
+                            'epoch': epoch + 1,
+                            'rank1': rank1,
+                        }, gcn_best_path)
+                        print(f'Best GCN model saved to {gcn_best_path}')
+                else:
+                    patience_counter += 1
+                    print(f'[Early Stopping] No improvement. Patience: {patience_counter}/{cfg.SOLVER.PATIENCE}')
+                    
+                    if patience_counter >= cfg.SOLVER.PATIENCE:
+                        print(f'[Early Stopping] Training stopped at epoch {epoch + 1}')
+                        print(f'Best Rank-1: {best_rank1:.2%} at epoch {best_epoch}')
+                        return
             
             if (epoch + 1) == cfg.SOLVER.MAX_EPOCHS and cfg.TEST.VIS_RANK == True:
                 visualize_ranked_results(
-                    distmat_re, dm.return_testdataset_by_name(name),
+                    distmat, dm.return_testdataset_by_name(name),
                     save_dir=osp.join(cfg.MISC.SAVE_DIR, 'ranked_results', name),
                     topk=20)
 
@@ -157,7 +222,7 @@ def do_train(cfg, trainloader, train_dict, data_tfr, testloader_dict, dm,
         if (epoch + 1) == cfg.SOLVER.MAX_EPOCHS:
             save_checkpoint({
                 'state_dict': model.state_dict(),
-                'rank1': rank2,
+                'rank1': rank1,
                 'epoch': epoch + 1,
                 'arch': cfg.MODEL.ARCH,
                 'optimizer': optimizer.state_dict(),

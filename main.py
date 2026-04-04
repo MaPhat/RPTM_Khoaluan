@@ -21,6 +21,7 @@ from utils.loggers import Logger
 from utils.torchtools import count_num_param, accuracy, load_pretrained_weights, save_checkpoint
 from utils.visualtools import visualize_ranked_results
 from utils.functions import create_split_dirs
+from utils.graph_reranking import *
 
 try:
     from apex import amp
@@ -87,9 +88,43 @@ def main():
         print("weights loaded")
         load_pretrained_weights(model, cfg.MODEL.PRETRAIN_PATH)
 
+    if cfg.TEST.EVAL and cfg.TEST.WEIGHT != '':
+        print("Loading trained backbone weights for evaluation: {}".format(cfg.TEST.WEIGHT))
+        load_pretrained_weights(model, cfg.TEST.WEIGHT)
+
+    gcn_model = None
+    
+    if cfg.TEST.LEARN_BASED:
+        print('Initializing GCN model')
+        gcn_model = GCNRefiner(feature_dim = model.feature_dim)
+        
+        # Load GCN model weights if in eval mode and pretrain path exists
+        if cfg.TEST.EVAL:
+            print("Loading GCN model weights for evaluation")
+            gcn_checkpoint_path = osp.join(cfg.MISC.SAVE_DIR, 'gcn_best_model.pth')
+            
+            if os.path.exists(gcn_checkpoint_path):
+                print("Loading GCN model weights from: {}".format(gcn_checkpoint_path))
+                gcn_checkpoint = torch.load(gcn_checkpoint_path, map_location="cpu", weights_only=False)
+                gcn_model.load_state_dict(gcn_checkpoint['state_dict'])
+            else:
+                print("Warning: GCN checkpoint not found at {}".format(gcn_checkpoint_path))
+
     if use_gpu:
         model = model.cuda()
+        if gcn_model is not None:
+            gcn_model = gcn_model.cuda()
     optimizer = init_optimizer(model, **optimizer_kwargs)
+
+    if cfg.TEST.LEARN_BASED and gcn_model is not None:
+        gcn_lr = cfg.SOLVER.BASE_LR * 0.1
+        gcn_weight_decay = cfg.SOLVER.WEIGHT_DECAY
+        optimizer.add_param_group({
+            'params': gcn_model.parameters(),
+            'lr': gcn_lr,
+            'weight_decay': gcn_weight_decay
+        })
+
     if APEX_AVAILABLE:
         model, optimizer = amp.initialize(
             model, optimizer, opt_level="O2",
@@ -107,11 +142,11 @@ def main():
             print('Evaluating {} ...'.format(name))
             queryloader = testloader_dict[name]['query']
             galleryloader = testloader_dict[name]['gallery']
-            _, distmat, _, distmat_re = do_test(model, queryloader, galleryloader, cfg.TEST.TEST_BATCH_SIZE, use_gpu, cfg.DATASET.TARGET_NAME[0])
+            rank1, distmat = do_test(model, queryloader, galleryloader, cfg.TEST.TEST_BATCH_SIZE, use_gpu, cfg.DATASET.TARGET_NAME[0], reranking=cfg.TEST.RE_RANKING, graph_reranking=cfg.TEST.GRAPH_RE_RANKING, learn_based=cfg.TEST.LEARN_BASED, gcn_model=gcn_model)
 
             if cfg.TEST.VIS_RANK:
                 visualize_ranked_results(
-                    distmat_re, dm.return_testdataset_by_name(name),
+                    distmat, dm.return_testdataset_by_name(name),
                     save_dir=osp.join(cfg.MISC.SAVE_DIR, 'ranked_results', name),
                     topk=20
                 )
@@ -119,18 +154,33 @@ def main():
 
     print('=> Start training')
 
-    do_train(cfg,
-          trainloader,
-          train_dict,
-          data_tfr,
-          testloader_dict,
-          dm,
-          model,
-          optimizer,
-          scheduler,
-          criterion_htri,
-          criterion_xent,
-          )
+    if gcn_model is not None:
+        do_train(cfg,
+            trainloader,
+            train_dict,
+            data_tfr,
+            testloader_dict,
+            dm,
+            model,
+            optimizer,
+            scheduler,
+            criterion_htri,
+            criterion_xent,
+            gcn_model=gcn_model
+            )
+    else:
+        do_train(cfg,
+            trainloader,
+            train_dict,
+            data_tfr,
+            testloader_dict,
+            dm,
+            model,
+            optimizer,
+            scheduler,
+            criterion_htri,
+            criterion_xent,
+            )
 
 
 if __name__ == '__main__':

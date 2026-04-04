@@ -5,7 +5,7 @@ from .duke import duke
 
 __imgreid_factory = {
     'veri': VeRi,
-    'vehicleID': VehicleID,
+    'vehicleid': VehicleID,
     'duke': duke,
 }
 def init_imgreid_dataset(name, **kwargs):
