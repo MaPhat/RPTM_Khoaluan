@@ -59,7 +59,6 @@ def do_train(cfg, trainloader, train_dict, data_tfr, testloader_dict, dm,
             for i in range(cfg.SOLVER.TRAIN_BATCH_SIZE):
 
                 labelx = str(label[i])
-                # print(labelx)
                 indexx = int(index[i])
                 cidx = int(pid[i])
                 if indexx > len(gms[labelx]) - 1:

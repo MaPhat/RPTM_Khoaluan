@@ -89,7 +89,7 @@ def build_global_graph(probFea, galFea, lambda1=4.2, gamma=0.2):
     norm_weights = weights / row_sum
 
     indices = torch.nonzero(weights > 0).t()
-    values = norm_weights[indices, indices[1]]
+    values = norm_weights[indices[0], indices[1]]
 
     A = torch.sparse_coo_tensor(
         indices,
@@ -108,7 +108,7 @@ def build_cross_camera_graph(probFea, galFea, q_camids, g_camids, lambda1=4.2, g
     camids = torch.cat([q_camids, g_camids])
 
     num_feature = features.size(0)
-    device = num_feature.device
+    device = features.device
 
     dist = torch.cdist(features, features, p=2)
     col = camids.unsqueeze(1)
@@ -138,7 +138,7 @@ def build_cross_camera_graph(probFea, galFea, q_camids, g_camids, lambda1=4.2, g
     norm_weights = weights / row_sum
 
     indices = torch.nonzero(weights > 0).t()
-    values = norm_weights[indices, indices[1]]
+    values = norm_weights[indices[0], indices[1]]
 
     A = torch.sparse_coo_tensor(
         indices,
@@ -151,20 +151,51 @@ def build_cross_camera_graph(probFea, galFea, q_camids, g_camids, lambda1=4.2, g
 
 def normalize_adj(adj_matrix):
     """
-    Thực hiện chuẩn hóa: D^(-1/2) * A * D^(-1/2)
+    Thực hiện chuẩn hóa đối xứng ma trận kề: D^(-1/2) * A_hat * D^(-1/2)
+    Hỗ trợ tự động cả ma trận dạng Đặc (Dense) khi Train và dạng Thưa (Sparse) khi Test.
     """
-    identity_matrix = torch.eye(adj_matrix.shape[0], device=adj_matrix.device)
-    adj_matrix_hat = adj_matrix + identity_matrix
+    device = adj_matrix.device
+    n = adj_matrix.shape[0]
 
-    D = adj_matrix_hat.sum(dim=1)
-    # Add epsilon to avoid division by zero
-    D = D + 1e-12
-    d_inv_sqrt = torch.pow(D, -0.5)
-    # Handle any inf or nan values
-    d_inv_sqrt = torch.where(torch.isfinite(d_inv_sqrt), d_inv_sqrt, torch.zeros_like(d_inv_sqrt))
-    d_mat_inv_sqrt = torch.diag(d_inv_sqrt)
+    # Kiểm tra xem ma trận kề là dạng Thưa (Sparse) hay dạng Đặc (Dense)
+    if adj_matrix.is_sparse:
+        # ----------------------------------------------------
+        # PHÂN NHÁNH 1: CHUẨN HÓA CHO MA TRẬN THƯA (Pha Test)
+        # ----------------------------------------------------
+        identity = torch.eye(n, device=device).to_sparse()
+        adj_hat = (adj_matrix + identity).coalesce()
 
-    return d_mat_inv_sqrt @ adj_matrix_hat @ d_mat_inv_sqrt
+        D = torch.sparse.sum(adj_hat, dim=1).to_dense()
+        D = D + 1e-12
+        d_inv_sqrt = torch.pow(D, -0.5)
+        d_inv_sqrt = torch.where(torch.isfinite(d_inv_sqrt), d_inv_sqrt, torch.zeros_like(d_inv_sqrt))
+
+        indices = adj_hat.indices()
+        values = adj_hat.values()
+
+        row_scale = d_inv_sqrt[indices[0]]
+        col_scale = d_inv_sqrt[indices[1]]
+        scaled_values = values * row_scale * col_scale
+
+        return torch.sparse_coo_tensor(indices, scaled_values, (n, n), device=device).coalesce()
+    else:
+        # ----------------------------------------------------
+        # PHÂN NHÁNH 2: CHUẨN HÓA CHO MA TRẬN ĐẶC (Pha Train)
+        # ----------------------------------------------------
+        # Thêm self-loop bằng ma trận đơn vị đặc
+        identity = torch.eye(n, device=device)
+        adj_hat = adj_matrix + identity
+
+        # Tính toán ma trận bậc D (tổng hàng)
+        D = adj_hat.sum(dim=1)
+        D = D + 1e-12
+        d_inv_sqrt = torch.pow(D, -0.5)
+        d_inv_sqrt = torch.where(torch.isfinite(d_inv_sqrt), d_inv_sqrt, torch.zeros_like(d_inv_sqrt))
+
+        # Sử dụng cơ chế broadcasting để thực hiện phép nhân đối xứng: d_i * A_ij * d_j
+        # Phép toán này có độ phức tạp chỉ O(N^2), nhanh hơn nhiều so với nhân ma trận thông thường
+        norm_adj = d_inv_sqrt.view(-1, 1) * adj_hat * d_inv_sqrt.view(1, -1)
+        return norm_adj
 
 def safe_to_tensor(data, device):
     if isinstance(data, torch.Tensor):
@@ -279,77 +310,53 @@ def build_graphs_for_batch(feat, camids, lambda1=4.2, gamma=0.2):
     ### BUILD GLOBAL GRAPH
     # Apply Cheb-GR in order to eliminate unnecessary edge in graph
     mean_g = torch.mean(dist, dim=1, keepdim=True)
-    std_g = torch.std(dist, dim=1, keepdim=True)
+    variance_g = torch.mean((dist - mean_g) ** 2, dim=1, keepdim=True)
+    std_g = torch.sqrt(variance_g + 1e-8)
 
     # Ti = µi − λσ
     threshold_g = mean_g - lambda1 * std_g
-    dist_adjust_g = dist.clone()
-    dist_adjust_g[dist_adjust_g > threshold_g] = float("inf")
+    valid_mask_g = (dist <= threshold_g)
 
     # Reliability-Aware Edge Weighting
     std_i_g, std_j_g = std_g, std_g.t()
     reliability_scale_g = std_i_g * std_j_g + 1e-8
     g_ij_g = torch.exp(-(dist ** 2) / reliability_scale_g)
-    base_weights_g = torch.exp(-(dist_adjust_g ** 2)/ gamma)
 
+    base_weights_g = torch.exp(-(dist ** 2)/ gamma)
     weights_g = base_weights_g * g_ij_g
+    weights_g = torch.where(valid_mask_g, weights_g, torch.zeros_like(weights_g))
+
     row_sum_g = weights_g.sum(dim=1, keepdim=True)
     row_sum_g[row_sum_g == 0] = 1e-12
-    norm_weights_g = weights_g / row_sum_g
-
-    indices_g = torch.nonzero(weights_g > 0).t()
     
-    values_g = norm_weights_g[indices_g, indices_g[1]]
+    row_sum_g = weights_g.sum(dim=1, keepdim=True)
+    A_g = weights_g / (row_sum_g + 1e-12)
 
-    A_g = torch.sparse_coo_tensor(
-        indices_g,
-        values_g,
-        (num_feature, num_feature),
-        device=device
-    ).coalesce()
-    
     ### BUILD CROSS GRAPH
     camids = camids.to(device).view(-1, 1)
     mask_cross = (camids != camids.T).float()
 
-    dist_cross = dist.clone()
-    dist_cross[mask_cross == 0] = float("inf")
-    mask_cross_bool = (mask_cross == 1)
-    num_cross = mask_cross_bool.sum(dim=1, keepdim=True)
+    num_cross = mask_cross.sum(dim=1, keepdim=True)
 
     # Apply Cheb-GR in order to eliminate unnecessary edge in graph
-    dist_masked_for_sum = dist.clone()
-    dist_masked_for_sum[~mask_cross_bool] = 0.0
-    mean_c = dist_masked_for_sum.sum(dim=1, keepdim=True) / (num_cross + 1e-8)
+    mean_c = (dist * mask_cross).sum(dim=1, keepdim=True) / (num_cross + 1e-8)
     variance_c = (((dist - mean_c) ** 2) * mask_cross).sum(dim=1, keepdim=True) / (num_cross + 1e-8)
     std_c = torch.sqrt(variance_c + 1e-8)
 
     threshold_c = mean_c - lambda1 * std_c
-    dist_c_adjust = dist_cross.clone()
-    dist_c_adjust[dist_c_adjust > threshold_c] = float("inf")
+    valid_mask_c = (mask_cross == 1) & (dist <= threshold_c)
 
     # Reliability-Aware Edge Weighting
     std_i_c, std_j_c = std_c, std_c.t()
     reliability_scale_c = std_i_c * std_j_c + 1e-8
-    g_ij_c = torch.exp(-(dist_cross ** 2) / reliability_scale_c)
+    g_ij_c = torch.exp(-(dist ** 2) / reliability_scale_c)
 
-    base_weights_c = torch.exp(-(dist_c_adjust ** 2) / gamma)
+    base_weights_c = torch.exp(-(dist ** 2) / gamma)
     weights_c = base_weights_c * g_ij_c
+    weights_c = torch.where(valid_mask_c, weights_c, torch.zeros_like(weights_c))
 
     row_sum_c = weights_c.sum(dim=1, keepdim=True)
-    row_sum_c[row_sum_c == 0] = 1e-12
-    norm_weights_c = weights_c / row_sum_c
-
-    indices_c = torch.nonzero(weights_c > 0).t()
-    
-    values_c = norm_weights_c[indices_c, indices_c[1]]
-
-    A_c = torch.sparse_coo_tensor(
-        indices_c,
-        values_c,
-        (num_feature, num_feature),
-        device=device
-    ).coalesce()
+    A_c = weights_c / (row_sum_c + 1e-12)
 
     return A_g, A_c
 

@@ -43,7 +43,7 @@ SOLVER:
   WARMUP_EPOCHS: 10
   WARMUP_METHOD: 'linear'
   LARGE_FC_LR: False
-  TRAIN_BATCH_SIZE: 20
+  TRAIN_BATCH_SIZE: 64
   USE_AMP: False
   CHECKPOINT_PERIOD: 10
   LOG_PERIOD: 50
@@ -55,10 +55,12 @@ LOSS:
   LAMBDA_XENT: 1.0
 
 TEST:
-  EVAL: True
+  EVAL: False
   WEIGHT: ''
   TEST_BATCH_SIZE: 100
-  RE_RANKING: True
+  LEARN_BASED: True
+  GRAPH_RE_RANKING: True
+  RE_RANKING: False
   VIS_RANK: True
   NECK_FEAT: 'after'
   FEAT_NORM: 'yes'
@@ -66,7 +68,7 @@ TEST:
 MISC:
   SAVE_DIR: './logs/veri/'
   GMS_PATH: './gms/veri/'
-  INDEX_PATH: './pkl/veri/index_vp.pkl'
+  INDEX_PATH: '/workspace/RPTM_Khoaluan/pkl/veri/index_vp.pkl'
   USE_GPU: True
   PRINT_FREQ: 100
   FP16: True
