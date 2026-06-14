@@ -1,6 +1,5 @@
 import numpy as np
 import torch
-# import gc
 import torch.nn.functional as F
 import torch.nn as nn
 import os
@@ -57,7 +56,7 @@ def cosine_distance(a, b, data_is_normalized=False):
     return 1. - np.dot(a, b.T)
 
 
-def build_global_graph(probFea, galFea, k=20, gamma=0.5):
+def build_global_graph(probFea, galFea, lambda1=4.2, gamma=0.2):
     """
     Xây dựng Global Graph (Equation 1 áp dụng cho toàn bộ)
     """
@@ -65,22 +64,43 @@ def build_global_graph(probFea, galFea, k=20, gamma=0.5):
     features = F.normalize(features, p=2, dim=1)
 
     num_feature = features.size(0)
+    device = features.device
     dist = torch.cdist(features, features, p=2)
-    topk_dist, topk_indices = torch.topk(dist, k=k, dim=1, largest=False)
+    # topk_dist, topk_indices = torch.topk(dist, k=k, dim=1, largest=False)
 
-    weights = torch.exp(-(topk_dist ** 2)/ gamma)
+    # Apply Cheb-GR in order to eliminate unnecessary edge in graph
+    mean = torch.mean(dist, dim=1, keepdim=True)
+    std = torch.std(dist, dim=1, keepdim=True)
 
-    A = torch.zeros((num_feature, num_feature), device=probFea.device)
+    # Ti = µi − λσ
+    threshold = mean - lambda1 * std
+    dist_adjust = dist.clone()
+    dist_adjust[dist_adjust > threshold] = float("inf")
 
-    for i in range(num_feature):
-        weight_value = weights[i, :k]
-        s = torch.sum(weight_value)
-        if s > 0:
-            A[i, topk_indices[i, :k]] = (weight_value / s).float()
+    # Reliability-Aware Edge Weighting
+    std_i, std_j = std, std.t()
+    reliability_scale = std_i * std_j + 1e-8
+    g_ij = torch.exp(-(dist ** 2) / reliability_scale)
+    base_weights = torch.exp(-(dist_adjust ** 2)/ gamma)
+
+    weights = base_weights * g_ij
+    row_sum = weights.sum(dim=1, keepdim=True)
+    row_sum[row_sum == 0] = 1e-12
+    norm_weights = weights / row_sum
+
+    indices = torch.nonzero(weights > 0).t()
+    values = norm_weights[indices, indices[1]]
+
+    A = torch.sparse_coo_tensor(
+        indices,
+        values,
+        (num_feature, num_feature),
+        device=device
+    ).coalesce()
 
     return A
 
-def build_cross_camera_graph(probFea, galFea, q_camids, g_camids, k=20, gamma=0.5):
+def build_cross_camera_graph(probFea, galFea, q_camids, g_camids, lambda1=4.2, gamma=0.2):
     """
     Xây dựng Cross-Camera Graph (Equation 1 có điều kiện camera khác nhau)
     """
@@ -88,25 +108,44 @@ def build_cross_camera_graph(probFea, galFea, q_camids, g_camids, k=20, gamma=0.
     camids = torch.cat([q_camids, g_camids])
 
     num_feature = features.size(0)
+    device = num_feature.device
+
     dist = torch.cdist(features, features, p=2)
     col = camids.unsqueeze(1)
     row = camids.unsqueeze(0)
     masked_id = (col != row)
 
     dist[~masked_id] = float('inf')
-    topk_dist, topk_indices = torch.topk(dist, k=k, dim=1, largest=False)
 
-    weights = torch.exp(-(topk_dist ** 2)/ gamma)
+    # Apply Cheb-GR in order to eliminate unnecessary edge in graph
+    mean = torch.mean(dist, dim=1, keepdim=True)
+    std = torch.std(dist, dim=1, keepdim=True)
 
-    A = torch.zeros((num_feature, num_feature), device=probFea.device)
+    # Ti = µi − λσ
+    threshold = mean - lambda1 * std
+    dist_adjust = dist.clone()
+    dist_adjust[dist_adjust > threshold] = float("inf")
 
+    # Reliability-Aware Edge Weighting
+    std_i, std_j = std, std.t()
+    reliability_scale = std_i * std_j + 1e-8
+    g_ij = torch.exp(-(dist ** 2) / reliability_scale)
+    base_weights = torch.exp(-(dist_adjust ** 2)/ gamma)
 
-    for i in range(num_feature):
-        weight_value = weights[i, :k]
-        s = torch.sum(weight_value)
-        if s > 0:
-            A[i, topk_indices[i, :k]] = (weight_value / s).float()
-        # else: all-inf distances (same-camera only dataset) → leave as zeros
+    weights = base_weights * g_ij
+    row_sum = weights.sum(dim=1, keepdim=True)
+    row_sum[row_sum == 0] = 1e-12
+    norm_weights = weights / row_sum
+
+    indices = torch.nonzero(weights > 0).t()
+    values = norm_weights[indices, indices[1]]
+
+    A = torch.sparse_coo_tensor(
+        indices,
+        values,
+        (num_feature, num_feature),
+        device=device
+    ).coalesce()
 
     return A
 
@@ -225,33 +264,92 @@ def graph_reranking_func(probFea, galFea, q_camids, g_camids, k=20, gamma=0.5, a
            
     return distmat.detach().cpu().numpy() 
 
-def build_graphs_for_batch(feat, camids, k=20, gamma=2.0):
+def build_graphs_for_batch(feat, camids, lambda1=4.2, gamma=0.2):
     """
     Xây dựng đồ thị động cho một Batch huấn luyện.
     feat: (N, D) - Đặc trưng trích xuất từ Backbone
     camids: (N,) - ID camera của từng ảnh trong batch
     k: Số lượng lân cận gần nhất
     """
-    # feat = torch.Tensor(feat)
-    N = feat.size(0)
+    num_feature = feat.size(0)
     device = feat.device
 
-    dist_mat = torch.cdist(feat.float(), feat.float(), p=2)
+    dist = torch.cdist(feat.float(), feat.float(), p=2)
 
-    curr_k = min(k, N)
-    _, nn_idx = torch.topk(dist_mat, k=curr_k, largest=False)
+    ### BUILD GLOBAL GRAPH
+    # Apply Cheb-GR in order to eliminate unnecessary edge in graph
+    mean_g = torch.mean(dist, dim=1, keepdim=True)
+    std_g = torch.std(dist, dim=1, keepdim=True)
+
+    # Ti = µi − λσ
+    threshold_g = mean_g - lambda1 * std_g
+    dist_adjust_g = dist.clone()
+    dist_adjust_g[dist_adjust_g > threshold_g] = float("inf")
+
+    # Reliability-Aware Edge Weighting
+    std_i_g, std_j_g = std_g, std_g.t()
+    reliability_scale_g = std_i_g * std_j_g + 1e-8
+    g_ij_g = torch.exp(-(dist ** 2) / reliability_scale_g)
+    base_weights_g = torch.exp(-(dist_adjust_g ** 2)/ gamma)
+
+    weights_g = base_weights_g * g_ij_g
+    row_sum_g = weights_g.sum(dim=1, keepdim=True)
+    row_sum_g[row_sum_g == 0] = 1e-12
+    norm_weights_g = weights_g / row_sum_g
+
+    indices_g = torch.nonzero(weights_g > 0).t()
     
-    A_g = torch.zeros(N, N, device=device)
-    weights = torch.exp(-dist_mat / gamma)
+    values_g = norm_weights_g[indices_g, indices_g[1]]
 
-    src_values = weights.gather(1, nn_idx)
-    A_g.scatter_(1, nn_idx, src_values.to(A_g.dtype))
-
-    camids = camids.to(device)
-    camids = camids.view(-1, 1)
+    A_g = torch.sparse_coo_tensor(
+        indices_g,
+        values_g,
+        (num_feature, num_feature),
+        device=device
+    ).coalesce()
+    
+    ### BUILD CROSS GRAPH
+    camids = camids.to(device).view(-1, 1)
     mask_cross = (camids != camids.T).float()
 
-    A_c = A_g * mask_cross
+    dist_cross = dist.clone()
+    dist_cross[mask_cross == 0] = float("inf")
+    mask_cross_bool = (mask_cross == 1)
+    num_cross = mask_cross_bool.sum(dim=1, keepdim=True)
+
+    # Apply Cheb-GR in order to eliminate unnecessary edge in graph
+    dist_masked_for_sum = dist.clone()
+    dist_masked_for_sum[~mask_cross_bool] = 0.0
+    mean_c = dist_masked_for_sum.sum(dim=1, keepdim=True) / (num_cross + 1e-8)
+    variance_c = (((dist - mean_c) ** 2) * mask_cross).sum(dim=1, keepdim=True) / (num_cross + 1e-8)
+    std_c = torch.sqrt(variance_c + 1e-8)
+
+    threshold_c = mean_c - lambda1 * std_c
+    dist_c_adjust = dist_cross.clone()
+    dist_c_adjust[dist_c_adjust > threshold_c] = float("inf")
+
+    # Reliability-Aware Edge Weighting
+    std_i_c, std_j_c = std_c, std_c.t()
+    reliability_scale_c = std_i_c * std_j_c + 1e-8
+    g_ij_c = torch.exp(-(dist_cross ** 2) / reliability_scale_c)
+
+    base_weights_c = torch.exp(-(dist_c_adjust ** 2) / gamma)
+    weights_c = base_weights_c * g_ij_c
+
+    row_sum_c = weights_c.sum(dim=1, keepdim=True)
+    row_sum_c[row_sum_c == 0] = 1e-12
+    norm_weights_c = weights_c / row_sum_c
+
+    indices_c = torch.nonzero(weights_c > 0).t()
+    
+    values_c = norm_weights_c[indices_c, indices_c[1]]
+
+    A_c = torch.sparse_coo_tensor(
+        indices_c,
+        values_c,
+        (num_feature, num_feature),
+        device=device
+    ).coalesce()
 
     return A_g, A_c
 
@@ -271,6 +369,7 @@ class GCNRefiner(nn.Module):
         A_global_norm = A_global_norm.float()
         A_cross_norm = A_cross_norm.float()      
         alpha = torch.clamp(self.alpha, 0.0, 1.0)
+
         support = alpha * torch.mm(A_global_norm, features) + \
                   (1 - alpha) * torch.mm(A_cross_norm, features)
 
